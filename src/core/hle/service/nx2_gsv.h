@@ -1024,8 +1024,31 @@ private:
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
             return value == nullptr || value[0] != '0';
         }();
+        // The game's present interval (vblanks per frame) is the high half of word 12.
+        const u32 present_interval = std::clamp<u32>((w[12] >> 16) & 0xff, 1, 4);
+        if (present_interval != m_present_interval) {
+            LOG_INFO(Service, "nx2:vi2 present interval {} -> {} (word 12 {:#x})",
+                     m_present_interval, present_interval, w[12]);
+            m_present_interval = present_interval;
+        }
+        // "Smooth 30 FPS" (mkw_smooth): two frames ahead at interval 2+. Two ahead once stalled the
+        // GPU thread for 4 s or more at MKW's boot-to-title switch (present ~187), so it starts
+        // after the first 1200 presents and backs off to one ahead for 300 presents whenever its
+        // wait takes over 100 ms (loading, shader compiles).
+        const bool two_ahead = frames_ahead && Settings::values.mkw_smooth.GetValue() &&
+                               m_present_interval > 1 && m_presents > 1200 &&
+                               m_smooth_cooldown == 0;
+        if (m_smooth_cooldown > 0) {
+            --m_smooth_cooldown;
+        }
         const auto entered = std::chrono::steady_clock::now();
-        if (frames_ahead) {
+        if (two_ahead) {
+            WaitForFrame(m_older_fence_id, m_older_fence_value);
+            m_older_fence_id = m_previous_fence_id;
+            m_older_fence_value = m_previous_fence_value;
+            m_previous_fence_id = ~w[22];
+            m_previous_fence_value = w[24];
+        } else if (frames_ahead) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
@@ -1036,6 +1059,9 @@ private:
             WaitForFrame(~w[22], w[24]);
         }
         const auto waited = std::chrono::steady_clock::now();
+        if (two_ahead && waited - entered > std::chrono::milliseconds{100}) {
+            m_smooth_cooldown = 300;
+        }
         Composite(w[5], ~w[22], w[24]);
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank();
@@ -1059,14 +1085,20 @@ private:
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
             }
             m_stats.last_present = entered;
+            // Game time: each present advances the game by its interval in vblanks (MKW counts
+            // 1 or 2 a frame), so vblanks per second against 60 is the game's speed.
+            m_stats.vblanks += m_present_interval;
+            m_stats.double_frames += m_present_interval > 1 ? 1 : 0;
             if (++m_stats.presents == 600) {
+                const double seconds = static_cast<double>(m_stats.frame_us) / 1e6;
                 LOG_INFO(Service,
                          "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms), "
                          "blocked on the GPU fence {} us (max {}), composite {} us, vblank "
-                         "pacing {} us",
+                         "pacing {} us; {} of them 2+ vblanks, game speed {:.0f}%",
                          m_stats.frame_us / 599, m_stats.max_frame_us, m_stats.hitches,
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
-                         m_stats.pace_us / 600);
+                         m_stats.pace_us / 600, m_stats.double_frames,
+                         seconds > 0 ? 100.0 * m_stats.vblanks / (seconds * 60.0) : 0.0);
                 m_stats = {.last_present = entered};
             }
         }
@@ -1085,10 +1117,16 @@ private:
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
         long long max_frame_us{}, hitches{};
         u32 presents{};
+        u32 vblanks{};
+        u32 double_frames{};
         std::chrono::steady_clock::time_point last_present{};
     } m_stats{};
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
+    u32 m_older_fence_id{~0U}; // the present before the previous one
+    u32 m_older_fence_value{};
+    u32 m_present_interval{1};
+    u32 m_smooth_cooldown{}; // presents left at one frame ahead after a long two-ahead wait
 
     // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
     // present faster than that. Every slot is reported free here: hold each present until the
