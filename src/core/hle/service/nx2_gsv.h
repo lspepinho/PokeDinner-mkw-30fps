@@ -21,6 +21,7 @@
 #include <optional>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "common/alignment.h"
@@ -1064,7 +1065,7 @@ private:
         }
         Composite(w[5], ~w[22], w[24]);
         const auto composited = std::chrono::steady_clock::now();
-        PaceToVblank();
+        PaceToVblank(w[12]);
         const auto paced = std::chrono::steady_clock::now();
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
@@ -1132,15 +1133,38 @@ private:
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     std::chrono::steady_clock::time_point m_next_vblank{};
+    u32 m_swap_word{};
 
-    void PaceToVblank() {
+    // timing: present word 12, (swap interval << 16) | refresh rate. Mario Kart World's 30 fps
+    // mode runs one frame every 2 vblanks: pace each present by the game's own interval, otherwise
+    // the game presents at 60 Hz with two vblanks of game time a frame (past 30 fps, fast-forward).
+    // EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
+    void PaceToVblank(u32 timing) {
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
-        const auto interval = std::chrono::nanoseconds{100'000'000'000LL / 60 / Settings::SpeedLimit()};
+        static const u32 forced_interval = [] {
+            const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
+            return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        // With MKW's dynamic frame rate the game times its own frames to pick 1 or 2 vblanks:
+        // holding a frame for 2 would make every frame last 2 and keep it at 30 fps for good, so
+        // pace to each vblank and let the game catch up through its interval.
+        const u32 swap_interval =
+            forced_interval != 0 ? forced_interval
+            : Settings::values.mkw_dynamic_fps.GetValue() ? 1U
+                                                          : std::clamp<u32>(timing >> 16, 1, 4);
+        const u32 refresh_rate =
+            (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        if (timing != std::exchange(m_swap_word, timing)) {
+            LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
+                     m_presents, swap_interval, refresh_rate, timing);
+        }
+        const auto interval = std::chrono::nanoseconds{100'000'000'000LL * swap_interval /
+                                                       refresh_rate / Settings::SpeedLimit()};
         const auto now = std::chrono::steady_clock::now();
         if (now > m_next_vblank + interval) {
-            // Running slower than 60 fps: show at once and don't bank the lost time.
+            // Running slower than the swap interval: show at once and don't bank the lost time.
             m_next_vblank = now;
         } else if (now < m_next_vblank) {
             std::this_thread::sleep_until(m_next_vblank);
